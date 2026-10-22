@@ -4,9 +4,38 @@ LiveWall - бесплатные живые обои для Windows.
 Запуск:     pythonw livewall.py   (или python livewall.py)
 Поддержка:  .mp4 .webm .mkv .avi .mov (видео), .gif, .html/.htm (веб-обои)
 """
-import sys, json, ctypes
+import sys, json, ctypes, traceback, faulthandler, datetime
 from ctypes import wintypes
 from pathlib import Path
+
+LOG = Path.home() / "livewall.log"
+
+
+def log(msg):
+    try:
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.datetime.now():%H:%M:%S}] {msg}\n")
+    except Exception:
+        pass
+
+
+def show_error(text):
+    ctypes.windll.user32.MessageBoxW(
+        0, text + f"\n\nПодробности в файле:\n{LOG}", "LiveWall - ошибка", 0x10)
+
+
+def excepthook(t, e, tb):
+    text = "".join(traceback.format_exception(t, e, tb))
+    log(text)
+    show_error(text[-900:])
+
+
+sys.excepthook = excepthook
+try:
+    faulthandler.enable(open(LOG, "a"))
+except Exception:
+    pass
+log("=== запуск ===")
 
 from PyQt6.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QFileDialog,
                              QWidget, QLabel)
@@ -23,47 +52,93 @@ ALL = VIDEO | HTML | {".gif"}
 CONFIG = Path.home() / ".livewall.json"
 
 user32 = ctypes.windll.user32
-user32.FindWindowW.restype = wintypes.HWND
-user32.FindWindowExW.restype = wintypes.HWND
-user32.GetForegroundWindow.restype = wintypes.HWND
+H = wintypes.HWND
+user32.FindWindowW.restype = H
+user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+user32.FindWindowExW.restype = H
+user32.FindWindowExW.argtypes = [H, H, wintypes.LPCWSTR, wintypes.LPCWSTR]
+user32.GetForegroundWindow.restype = H
+user32.SetParent.restype = H
+user32.SetParent.argtypes = [H, H]
+user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+user32.GetWindowLongPtrW.argtypes = [H, ctypes.c_int]
+user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+user32.SetWindowLongPtrW.argtypes = [H, ctypes.c_int, ctypes.c_ssize_t]
+user32.SetWindowPos.argtypes = [H, H, ctypes.c_int, ctypes.c_int,
+                                ctypes.c_int, ctypes.c_int, wintypes.UINT]
+
+GWL_STYLE, GWL_EXSTYLE = -16, -20
+WS_POPUP, WS_CHILD = 0x80000000, 0x40000000
+WS_EX_NOREDIRECTIONBITMAP = 0x00200000
+SWP_FLAGS = 0x0001 | 0x0002 | 0x0010 | 0x0020  # NOSIZE|NOMOVE|NOACTIVATE|FRAMECHANGED
+HWND_BOTTOM = 1
 
 
-# ---------- встраивание окна за иконки рабочего стола ----------
-def get_workerw():
+def attach_behind_icons(hwnd):
+    """Прячет окно за иконки рабочего стола (Win10 и Win11, включая 24H2+)."""
+    hwnd = int(hwnd)
     progman = user32.FindWindowW("Progman", None)
     user32.SendMessageTimeoutW(progman, 0x052C, 0, 0, 0, 1000, None)
+    raised = user32.GetWindowLongPtrW(progman, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP
+
+    if raised:
+        # Win11 24H2+: окно становится дочерним для Progman, ниже слоя с иконками
+        style = user32.GetWindowLongPtrW(hwnd, GWL_STYLE) & 0xFFFFFFFF
+        style = (style & ~WS_POPUP) | WS_CHILD
+        user32.SetWindowLongPtrW(hwnd, GWL_STYLE, style)
+        user32.SetParent(hwnd, progman)
+        defview = user32.FindWindowExW(progman, None, "SHELLDLL_DefView", None)
+        user32.SetWindowPos(hwnd, defview or HWND_BOTTOM, 0, 0, 0, 0, SWP_FLAGS)
+        shell_worker = user32.FindWindowExW(progman, None, "WorkerW", None)
+        if shell_worker:
+            user32.SetWindowPos(shell_worker, HWND_BOTTOM, 0, 0, 0, 0, SWP_FLAGS)
+        log("attach: режим 24H2+ (Progman)")
+        return
+
     found = []
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def enum_cb(hwnd, _):
-        if user32.FindWindowExW(hwnd, None, "SHELLDLL_DefView", None):
-            w = user32.FindWindowExW(None, hwnd, "WorkerW", None)
+    def enum_cb(h, _):
+        if user32.FindWindowExW(h, None, "SHELLDLL_DefView", None):
+            w = user32.FindWindowExW(None, h, "WorkerW", None)
             if w:
                 found.append(w)
         return True
 
     user32.EnumWindows(enum_cb, 0)
-    if found:                       # классическая схема (Win10 / ранние Win11)
-        return found[0]
-    child = user32.FindWindowExW(progman, None, "WorkerW", None)
-    return child or progman        # Win11 24H2+
+    target = found[0] if found else progman
+    user32.SetParent(hwnd, target)
+    log(f"attach: классический режим, parent={target}")
 
 
 class Wallpaper(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
         self.setStyleSheet("background:black")
         self.inner = None
         self.player = None
         self.muted = True
         self.paused = False
-        self.show()
         scr = QApplication.primaryScreen().geometry()
         virt = QApplication.primaryScreen().virtualGeometry()
-        user32.SetParent(int(self.winId()), get_workerw())
-        self.setGeometry(scr.x() - virt.x(), scr.y() - virt.y(),
-                         scr.width(), scr.height())
+        self._geom = (scr.x() - virt.x(), scr.y() - virt.y(),
+                      scr.width(), scr.height())
+        self.setGeometry(*self._geom)
+        self.hwnd = int(self.winId())   # окно создано, но пока не показано
+        attach_behind_icons(self.hwnd)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        # повторно закрепляем после показа: Qt мог сбросить стиль окна
+        QTimer.singleShot(150, self._reattach)
+
+    def _reattach(self):
+        attach_behind_icons(self.hwnd)
+        self.setGeometry(*self._geom)
+        if self.inner:
+            self.inner.setGeometry(self.rect())
 
     def clear(self):
         if self.player:
@@ -102,6 +177,8 @@ class Wallpaper(QWidget):
         w.setGeometry(self.rect())
         w.show()
         self.inner = w
+        if not self.isVisible():
+            self.show()
 
     def set_paused(self, value):
         if value == self.paused or not self.inner:
@@ -145,7 +222,9 @@ def main():
     cfg = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
     save = lambda: CONFIG.write_text(json.dumps(cfg))
 
+    log("создаю окно обоев")
     wall = Wallpaper()
+    log("окно создано")
     wall.muted = cfg.get("muted", True)
 
     def apply(path):
@@ -167,7 +246,7 @@ def main():
             return
         for f in sorted(Path(folder).iterdir()):
             if f.suffix.lower() in ALL:
-                lib_menu.addAction(f.name, lambda p=f: apply(p))
+                lib_menu.addAction(f.name, lambda checked=False, p=f: apply(p))
 
     def pick_file():
         f, _ = QFileDialog.getOpenFileName(
@@ -199,6 +278,7 @@ def main():
     tray.setContextMenu(menu)
     tray.setToolTip("LiveWall")
     tray.show()
+    log("трей показан")
     rebuild_library()
 
     if cfg.get("current") and Path(cfg["current"]).exists():
@@ -212,4 +292,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        excepthook(*sys.exc_info())
